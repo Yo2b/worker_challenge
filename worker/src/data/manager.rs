@@ -1,35 +1,65 @@
+use std::ops::Deref;
+use std::sync::Arc;
+
 use super::*;
+
+// > Each chunk has approximate size of 200 MB and each worker can store up to 1 TB of data on disk.
+// This could be mitigated to reserve capacity for less entries by default and allow more frequent dynamic reallocation.
+#[allow(clippy::identity_op)]
+const DEFAULT_CAPACITY: usize = 1 * 1_024 * 1_024 / 200;
 
 /// Worker's data manager.
 #[derive(Debug)]
-pub struct WorkerDataManager;
+pub struct WorkerDataManager {
+    data_dir: PathBuf,
+    data_chunks: HashMap<ChunkId, Arc<DataChunk>>,
+}
 
 impl DataManager for WorkerDataManager {
     fn new(data_dir: PathBuf) -> Self {
-        unimplemented!()
+        let mut manager = Self::new_uninit(data_dir);
+
+        if manager.data_dir.try_exists().expect("root dir cannot be accessed") {
+            todo!("populate data chunks from local storage")
+        }
+
+        manager
     }
 
     fn download_chunk(&self, chunk: DataChunk) {
-        unimplemented!()
+        if !self.data_chunks.contains_key(&chunk.id) {
+            todo!("download {chunk:?}")
+        }
     }
 
     fn list_chunks(&self) -> Vec<ChunkId> {
-        unimplemented!()
+        self.data_chunks.keys().cloned().collect()
     }
 
-    fn find_chunk(&self, dataset_id: DatasetId, block_number: u64) -> Option<impl DataChunkRef> {
-        unimplemented!();
-
-        None::<WorkerDataChunkRef>
+    #[allow(refining_impl_trait_reachable)]
+    fn find_chunk(&self, dataset_id: DatasetId, block_number: u64) -> Option<impl DataChunkRef + Deref<Target = DataChunk>> {
+        self.data_chunks
+            .values()
+            .find(|&chunk| chunk.dataset_id == dataset_id && chunk.block_range.contains(&block_number))
+            .map(|chunk| WorkerDataChunkRef(self.chunk_path(chunk), Arc::clone(chunk)))
     }
 
     fn delete_chunk(&self, chunk_id: ChunkId) {
-        unimplemented!()
+        if self.data_chunks.contains_key(&chunk_id) {
+            todo!("delete {chunk_id:?}")
+        }
     }
 }
 
 impl WorkerDataManager {
-    fn chunk_path(chunk: &DataChunk) -> PathBuf {
+    fn new_uninit(data_dir: PathBuf) -> Self {
+        Self {
+            data_dir,
+            data_chunks: HashMap::with_capacity(DEFAULT_CAPACITY),
+        }
+    }
+
+    fn chunk_path(&self, chunk: &DataChunk) -> PathBuf {
         let chunk_id = [
             utils::encode_id(&chunk.id),
             utils::encode_id(&chunk.dataset_id),
@@ -38,7 +68,7 @@ impl WorkerDataManager {
         ]
         .join(std::ffi::OsStr::new("_"));
 
-        PathBuf::from(chunk_id)
+        self.data_dir.join(chunk_id)
     }
 
     fn data_chunk(chunk_id: &std::ffi::OsStr) -> std::io::Result<DataChunk> {
@@ -87,11 +117,21 @@ impl WorkerDataManager {
 
 /// Worker's data chunk reference.
 #[derive(Debug, Clone)]
-pub struct WorkerDataChunkRef;
+pub struct WorkerDataChunkRef(PathBuf, Arc<DataChunk>);
+
+impl Deref for WorkerDataChunkRef {
+    type Target = DataChunk;
+
+    #[inline]
+    fn deref(&self) -> &Self::Target {
+        &self.1
+    }
+}
 
 impl DataChunkRef for WorkerDataChunkRef {
+    #[inline]
     fn path(&self) -> &Path {
-        unimplemented!()
+        &self.0
     }
 }
 
@@ -99,9 +139,29 @@ impl DataChunkRef for WorkerDataChunkRef {
 mod tests {
     use super::*;
 
+    #[test]
+    #[ignore = "not an actual test"]
+    fn test_size_of() {
+        fn print_size_of<T>() {
+            println!("{}: {}", std::any::type_name::<T>(), size_of::<T>());
+        }
+
+        print_size_of::<WorkerDataManager>();
+        print_size_of::<DataChunk>();
+        print_size_of::<Arc<DataChunk>>();
+        print_size_of::<ChunkId>();
+
+        println!(
+            "Default reserved min. size: {} bytes",
+            DEFAULT_CAPACITY * (size_of::<ChunkId>() + size_of::<Arc<DataChunk>>())
+        );
+    }
+
     const CHUNK_ID: &ChunkId = b"00000000000000000000000000000123";
     const DATASET_ID: &DatasetId = b"cdefghijklmnopqrstuvwxyz01234567";
     const BLOCK_RANGE: Range<u64> = 3..7;
+    const BLOCK_IN: u64 = (BLOCK_RANGE.end + BLOCK_RANGE.start) / 2;
+    const BLOCK_OUT: u64 = BLOCK_RANGE.end + 1;
 
     fn expected_data_chunk() -> DataChunk {
         DataChunk::new(*CHUNK_ID, *DATASET_ID, BLOCK_RANGE)
@@ -121,10 +181,11 @@ mod tests {
     fn test_chunk_path() {
         let chunk = expected_data_chunk();
 
-        let chunk_path = WorkerDataManager::chunk_path(&chunk);
+        let manager = WorkerDataManager::new_uninit(PathBuf::from("a/b"));
+        let chunk_path = manager.chunk_path(&chunk);
 
         assert!(
-            chunk_path.iter().eq([expected_data_chunk_str().as_ref() as &std::ffi::OsStr]),
+            chunk_path.iter().eq(["a", "b", &expected_data_chunk_str()]),
             "'{}' didn't match expected path",
             chunk_path.display()
         );
@@ -137,5 +198,47 @@ mod tests {
         let chunk = WorkerDataManager::data_chunk(chunk_str.as_ref()).unwrap();
 
         assert_eq!(chunk, expected_data_chunk());
+    }
+
+    #[test]
+    #[should_panic]
+    fn test_data_manager() {
+        let mut manager = WorkerDataManager::new_uninit(PathBuf::from("path/is/unlikely/to/exist"));
+
+        assert!(manager.list_chunks().is_empty());
+
+        manager.download_chunk(expected_data_chunk());
+
+        assert!(manager.list_chunks().contains(CHUNK_ID));
+
+        manager.delete_chunk(*CHUNK_ID);
+
+        assert!(!manager.list_chunks().contains(CHUNK_ID));
+
+        manager.download_chunk(expected_data_chunk());
+
+        assert!(manager.list_chunks().contains(CHUNK_ID));
+
+        assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), None);
+        assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_OUT).as_deref(), None);
+
+        {
+            println!("{:?}", manager.data_chunks.get(CHUNK_ID));
+
+            manager.data_chunks.entry(*CHUNK_ID).or_insert(expected_data_chunk().into());
+
+            println!("{:?}", manager.data_chunks.get(CHUNK_ID));
+        }
+
+        let expected = expected_data_chunk();
+        assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), Some(expected).as_ref());
+        assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_OUT).as_deref(), None);
+
+        manager.delete_chunk(*CHUNK_ID);
+
+        assert!(!manager.list_chunks().contains(CHUNK_ID));
+
+        assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), None);
+        assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_OUT).as_deref(), None);
     }
 }

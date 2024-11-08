@@ -2,6 +2,9 @@ use std::collections::HashMap;
 use std::ops::Range;
 use std::path::{Path, PathBuf};
 
+mod manager;
+pub use manager::*;
+
 pub type DatasetId = [u8; 32];
 pub type ChunkId = [u8; 32];
 

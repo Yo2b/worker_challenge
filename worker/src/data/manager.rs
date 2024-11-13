@@ -8,11 +8,18 @@ use super::*;
 #[allow(clippy::identity_op)]
 const DEFAULT_CAPACITY: usize = 1 * 1_024 * 1_024 / 200;
 
+/// Worker's data chunk state.
+#[derive(Debug)]
+enum DataChunkState {
+    Downloading(Box<DataChunk>),
+    Ready(Arc<DataChunk>),
+}
+
 /// Worker's data manager.
 #[derive(Debug)]
 pub struct WorkerDataManager {
     data_dir: PathBuf,
-    data_chunks: HashMap<ChunkId, Arc<DataChunk>>,
+    data_chunks: HashMap<ChunkId, DataChunkState>,
 }
 
 impl DataManager for WorkerDataManager {
@@ -20,7 +27,15 @@ impl DataManager for WorkerDataManager {
         let mut manager = Self::new_uninit(data_dir);
 
         if manager.data_dir.try_exists().expect("root dir cannot be accessed") {
-            todo!("populate data chunks from local storage")
+            tracing::debug!("Populate data chunks from local storage: `{}`", manager.data_dir.display());
+
+            let chunks = Self::walk_dir(&manager.data_dir).expect("chunks cannot be accessed");
+
+            let chunks = chunks
+                .into_iter()
+                .map(|(_, chunk)| (chunk.id, DataChunkState::Ready(Arc::new(chunk))));
+
+            manager.data_chunks.extend(chunks);
         }
 
         manager
@@ -38,15 +53,22 @@ impl DataManager for WorkerDataManager {
 
     #[allow(refining_impl_trait_reachable)]
     fn find_chunk(&self, dataset_id: DatasetId, block_number: u64) -> Option<impl DataChunkRef + Deref<Target = DataChunk>> {
-        self.data_chunks
-            .values()
-            .find(|&chunk| chunk.dataset_id == dataset_id && chunk.block_range.contains(&block_number))
-            .map(|chunk| WorkerDataChunkRef(self.chunk_path(chunk), Arc::clone(chunk)))
+        self.data_chunks.values().find_map(|state| match state {
+            DataChunkState::Ready(chunk) if chunk.dataset_id == dataset_id && chunk.block_range.contains(&block_number) => {
+                Some(WorkerDataChunkRef(self.chunk_path(chunk), Arc::clone(chunk)))
+            }
+            _ => None,
+        })
     }
 
     fn delete_chunk(&self, chunk_id: ChunkId) {
         if self.data_chunks.contains_key(&chunk_id) {
-            todo!("delete {chunk_id:?}")
+            let state = self.data_chunks.get(&chunk_id).unwrap();
+
+            match state {
+                DataChunkState::Downloading(chunk) => todo!("abort {chunk:?}"),
+                DataChunkState::Ready(chunk) => todo!("delete {chunk:?}"),
+            }
         }
     }
 }
@@ -100,12 +122,16 @@ impl WorkerDataManager {
                 let chunk_id = entry.file_name();
                 let chunk_dir = entry.path();
 
+                tracing::trace!("Read data chunk {chunk_id:?} from local storage: `{}`", chunk_dir.display());
+
                 let chunk_files = vec![];
 
                 // TODO: read chunk descriptor (file names with their associated HTTP URL) from local storage
                 // TODO: ultimately check chunk completeness and integrity of stored files
 
                 let chunk = Self::data_chunk(&chunk_id)?.with_files(chunk_files);
+
+                tracing::trace!("Found data chunk {chunk:?} from local storage: `{}`", chunk_dir.display());
 
                 chunks.push((chunk_dir, chunk));
             }
@@ -225,7 +251,10 @@ mod tests {
         {
             println!("{:?}", manager.data_chunks.get(CHUNK_ID));
 
-            manager.data_chunks.entry(*CHUNK_ID).or_insert(expected_data_chunk().into());
+            manager
+                .data_chunks
+                .entry(*CHUNK_ID)
+                .and_modify(|state| *state = DataChunkState::Ready(expected_data_chunk().into()));
 
             println!("{:?}", manager.data_chunks.get(CHUNK_ID));
         }

@@ -5,11 +5,14 @@ use std::path::{Path, PathBuf};
 mod manager;
 pub use manager::*;
 
+mod utils;
+
 pub type DatasetId = [u8; 32];
 pub type ChunkId = [u8; 32];
 
 /// Data chunk description.
 #[allow(dead_code)]
+#[derive(Debug, PartialEq, Eq)]
 pub struct DataChunk {
     id: ChunkId,
 
@@ -25,6 +28,25 @@ pub struct DataChunk {
     /// Usually contains 1 - 10 files of various sizes.
     /// The total size of all files in the chunk is about 200 MB.
     files: HashMap<String, String>,
+}
+
+impl DataChunk {
+    pub fn new(id: ChunkId, dataset_id: DatasetId, block_range: Range<u64>) -> Self {
+        Self {
+            id,
+            dataset_id,
+            block_range,
+            files: Default::default(),
+        }
+    }
+
+    #[inline]
+    pub fn with_files<I: IntoIterator<Item = (String, String)>>(self, iter: I) -> Self {
+        Self {
+            files: FromIterator::from_iter(iter),
+            ..self
+        }
+    }
 }
 
 /// Data manager interface.

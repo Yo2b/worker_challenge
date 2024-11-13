@@ -1,5 +1,5 @@
 use std::ops::Deref;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use super::*;
 
@@ -19,7 +19,7 @@ enum DataChunkState {
 #[derive(Debug)]
 pub struct WorkerDataManager {
     data_dir: PathBuf,
-    data_chunks: HashMap<ChunkId, DataChunkState>,
+    data_chunks: RwLock<HashMap<ChunkId, DataChunkState>>,
 }
 
 impl DataManager for WorkerDataManager {
@@ -27,6 +27,8 @@ impl DataManager for WorkerDataManager {
         let mut manager = Self::new_uninit(data_dir);
 
         if manager.data_dir.try_exists().expect("root dir cannot be accessed") {
+            let data_chunks = manager.data_chunks.get_mut().unwrap();
+
             tracing::debug!("Populate data chunks from local storage: `{}`", manager.data_dir.display());
 
             let chunks = Self::walk_dir(&manager.data_dir).expect("chunks cannot be accessed");
@@ -35,25 +37,34 @@ impl DataManager for WorkerDataManager {
                 .into_iter()
                 .map(|(_, chunk)| (chunk.id, DataChunkState::Ready(Arc::new(chunk))));
 
-            manager.data_chunks.extend(chunks);
+            data_chunks.extend(chunks);
         }
 
         manager
     }
 
     fn download_chunk(&self, chunk: DataChunk) {
-        if !self.data_chunks.contains_key(&chunk.id) {
-            todo!("download {chunk:?}")
+        let data_chunks = self.data_chunks.read().unwrap();
+
+        if !data_chunks.contains_key(&chunk.id) {
+            drop(data_chunks);
+
+            // check if the entry is still vacant, otherwise a download has already been initiated in the meantime
+            self.data_chunks.write().unwrap().entry(chunk.id).or_insert_with(|| {
+                todo!("download {chunk:?}");
+
+                DataChunkState::Downloading(chunk.into())
+            });
         }
     }
 
     fn list_chunks(&self) -> Vec<ChunkId> {
-        self.data_chunks.keys().cloned().collect()
+        self.data_chunks.read().unwrap().keys().cloned().collect()
     }
 
     #[allow(refining_impl_trait_reachable)]
     fn find_chunk(&self, dataset_id: DatasetId, block_number: u64) -> Option<impl DataChunkRef + Deref<Target = DataChunk>> {
-        self.data_chunks.values().find_map(|state| match state {
+        self.data_chunks.read().unwrap().values().find_map(|state| match state {
             DataChunkState::Ready(chunk) if chunk.dataset_id == dataset_id && chunk.block_range.contains(&block_number) => {
                 Some(WorkerDataChunkRef(self.chunk_path(chunk), Arc::clone(chunk)))
             }
@@ -62,12 +73,17 @@ impl DataManager for WorkerDataManager {
     }
 
     fn delete_chunk(&self, chunk_id: ChunkId) {
-        if self.data_chunks.contains_key(&chunk_id) {
-            let state = self.data_chunks.get(&chunk_id).unwrap();
+        let data_chunks = self.data_chunks.read().unwrap();
 
-            match state {
-                DataChunkState::Downloading(chunk) => todo!("abort {chunk:?}"),
-                DataChunkState::Ready(chunk) => todo!("delete {chunk:?}"),
+        if data_chunks.contains_key(&chunk_id) {
+            drop(data_chunks);
+
+            let opt_state = self.data_chunks.write().unwrap().remove(&chunk_id);
+
+            match opt_state {
+                Some(DataChunkState::Downloading(chunk)) => todo!("abort {chunk:?}"),
+                Some(DataChunkState::Ready(chunk)) => todo!("delete {chunk:?}"),
+                None => { /* entry has already been removed in the meantime */ }
             }
         }
     }
@@ -77,7 +93,7 @@ impl WorkerDataManager {
     fn new_uninit(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
-            data_chunks: HashMap::with_capacity(DEFAULT_CAPACITY),
+            data_chunks: HashMap::with_capacity(DEFAULT_CAPACITY).into(),
         }
     }
 
@@ -229,7 +245,7 @@ mod tests {
     #[test]
     #[should_panic]
     fn test_data_manager() {
-        let mut manager = WorkerDataManager::new_uninit(PathBuf::from("path/is/unlikely/to/exist"));
+        let manager = WorkerDataManager::new_uninit(PathBuf::from("path/is/unlikely/to/exist"));
 
         assert!(manager.list_chunks().is_empty());
 
@@ -249,14 +265,15 @@ mod tests {
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_OUT).as_deref(), None);
 
         {
-            println!("{:?}", manager.data_chunks.get(CHUNK_ID));
+            let mut data_chunks = manager.data_chunks.write().unwrap();
 
-            manager
-                .data_chunks
+            println!("{:?}", data_chunks.get(CHUNK_ID));
+
+            data_chunks
                 .entry(*CHUNK_ID)
                 .and_modify(|state| *state = DataChunkState::Ready(expected_data_chunk().into()));
 
-            println!("{:?}", manager.data_chunks.get(CHUNK_ID));
+            println!("{:?}", data_chunks.get(CHUNK_ID));
         }
 
         let expected = expected_data_chunk();

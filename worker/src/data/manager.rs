@@ -1,5 +1,8 @@
+use std::num::NonZeroU8;
 use std::ops::Deref;
 use std::sync::{Arc, RwLock};
+
+use futures::future::AbortHandle;
 
 use super::*;
 
@@ -7,11 +10,12 @@ use super::*;
 // This could be mitigated to reserve capacity for less entries by default and allow more frequent dynamic reallocation.
 #[allow(clippy::identity_op)]
 const DEFAULT_CAPACITY: usize = 1 * 1_024 * 1_024 / 200;
+const POOL_SIZE: NonZeroU8 = unsafe { NonZeroU8::new_unchecked(10) };
 
 /// Worker's data chunk state.
 #[derive(Debug)]
 enum DataChunkState {
-    Downloading(Box<DataChunk>),
+    Downloading(Option<Box<(DataChunk, AbortHandle)>>),
     Ready(Arc<DataChunk>),
 }
 
@@ -20,6 +24,7 @@ enum DataChunkState {
 pub struct WorkerDataManager {
     data_dir: PathBuf,
     data_chunks: RwLock<HashMap<ChunkId, DataChunkState>>,
+    pool: crate::task::Pool,
 }
 
 impl DataManager for WorkerDataManager {
@@ -40,6 +45,8 @@ impl DataManager for WorkerDataManager {
             data_chunks.extend(chunks);
         }
 
+        manager.pool.start(POOL_SIZE);
+
         manager
     }
 
@@ -51,9 +58,11 @@ impl DataManager for WorkerDataManager {
 
             // check if the entry is still vacant, otherwise a download has already been initiated in the meantime
             self.data_chunks.write().unwrap().entry(chunk.id).or_insert_with(|| {
-                todo!("download {chunk:?}");
+                let (remote_handle, abort_handle) = self.pool.execute(async move { todo!("download {:?}", chunk.id) });
 
-                DataChunkState::Downloading(chunk.into())
+                remote_handle.forget();
+
+                DataChunkState::Downloading(Some(Box::new((chunk, abort_handle))))
             });
         }
     }
@@ -81,8 +90,16 @@ impl DataManager for WorkerDataManager {
             let opt_state = self.data_chunks.write().unwrap().remove(&chunk_id);
 
             match opt_state {
-                Some(DataChunkState::Downloading(chunk)) => todo!("abort {chunk:?}"),
-                Some(DataChunkState::Ready(chunk)) => todo!("delete {chunk:?}"),
+                Some(DataChunkState::Downloading(ctx)) => {
+                    let (chunk, handle) = *ctx.unwrap();
+
+                    handle.abort();
+
+                    self.pool.forget(async move { todo!("delete incomplete {chunk:?}") });
+                }
+                Some(DataChunkState::Ready(chunk)) => {
+                    self.pool.forget(async move { todo!("delete {chunk:?}") });
+                }
                 None => { /* entry has already been removed in the meantime */ }
             }
         }
@@ -94,6 +111,7 @@ impl WorkerDataManager {
         Self {
             data_dir,
             data_chunks: HashMap::with_capacity(DEFAULT_CAPACITY).into(),
+            pool: crate::task::Pool::default(),
         }
     }
 
@@ -189,7 +207,9 @@ mod tests {
         }
 
         print_size_of::<WorkerDataManager>();
+        print_size_of::<AbortHandle>();
         print_size_of::<DataChunk>();
+        print_size_of::<Option<Box<(DataChunk, AbortHandle)>>>();
         print_size_of::<Arc<DataChunk>>();
         print_size_of::<ChunkId>();
 
@@ -243,7 +263,7 @@ mod tests {
     }
 
     #[test]
-    #[should_panic]
+    #[tracing_test::traced_test]
     fn test_data_manager() {
         let manager = WorkerDataManager::new_uninit(PathBuf::from("path/is/unlikely/to/exist"));
 
@@ -286,5 +306,9 @@ mod tests {
 
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), None);
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_OUT).as_deref(), None);
+
+        drop(manager);
+
+        println!("Manager dropped!");
     }
 }

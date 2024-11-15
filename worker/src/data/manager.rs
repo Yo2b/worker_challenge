@@ -23,7 +23,7 @@ enum DataChunkState {
 #[derive(Debug)]
 pub struct WorkerDataManager {
     data_dir: PathBuf,
-    data_chunks: RwLock<HashMap<ChunkId, DataChunkState>>,
+    data_chunks: Arc<RwLock<HashMap<ChunkId, DataChunkState>>>,
     pool: crate::task::Pool,
 }
 
@@ -32,7 +32,8 @@ impl DataManager for WorkerDataManager {
         let mut manager = Self::new_uninit(data_dir);
 
         if manager.data_dir.try_exists().expect("root dir cannot be accessed") {
-            let data_chunks = manager.data_chunks.get_mut().unwrap();
+            let data_chunks = Arc::get_mut(&mut manager.data_chunks).unwrap();
+            let data_chunks = data_chunks.get_mut().unwrap();
 
             tracing::debug!("Populate data chunks from local storage: `{}`", manager.data_dir.display());
 
@@ -58,7 +59,32 @@ impl DataManager for WorkerDataManager {
 
             // check if the entry is still vacant, otherwise a download has already been initiated in the meantime
             self.data_chunks.write().unwrap().entry(chunk.id).or_insert_with(|| {
-                let (remote_handle, abort_handle) = self.pool.execute(async move { todo!("download {:?}", chunk.id) });
+                let data_chunks = Arc::clone(&self.data_chunks);
+
+                let (remote_handle, abort_handle) = self.pool.execute(async move {
+                    // TODO: download chunk
+
+                    // chunk can still be canceled while awaiting for a write access
+                    let canceled = data_chunks
+                        .write()
+                        .unwrap()
+                        .get_mut(&chunk.id)
+                        .map(|state| match state {
+                            DataChunkState::Downloading(ctx) => {
+                                let (chunk, handle) = *ctx.take().unwrap();
+
+                                debug_assert!(!handle.is_aborted());
+
+                                *state = DataChunkState::Ready(Arc::new(chunk));
+                            }
+                            _ => unreachable!(),
+                        })
+                        .is_none();
+
+                    if canceled {
+                        todo!("delete canceled {:?}", chunk.id)
+                    }
+                });
 
                 remote_handle.forget();
 
@@ -110,7 +136,7 @@ impl WorkerDataManager {
     fn new_uninit(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
-            data_chunks: HashMap::with_capacity(DEFAULT_CAPACITY).into(),
+            data_chunks: Arc::new(RwLock::new(HashMap::with_capacity(DEFAULT_CAPACITY))),
             pool: crate::task::Pool::default(),
         }
     }
@@ -262,10 +288,10 @@ mod tests {
         assert_eq!(chunk, expected_data_chunk());
     }
 
-    #[test]
+    #[tokio::test/* (flavor = "multi_thread") */]
     #[tracing_test::traced_test]
-    fn test_data_manager() {
-        let manager = WorkerDataManager::new_uninit(PathBuf::from("path/is/unlikely/to/exist"));
+    async fn test_data_manager() {
+        let manager = WorkerDataManager::new(PathBuf::from("path/is/unlikely/to/exist"));
 
         assert!(manager.list_chunks().is_empty());
 
@@ -284,17 +310,8 @@ mod tests {
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), None);
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_OUT).as_deref(), None);
 
-        {
-            let mut data_chunks = manager.data_chunks.write().unwrap();
-
-            println!("{:?}", data_chunks.get(CHUNK_ID));
-
-            data_chunks
-                .entry(*CHUNK_ID)
-                .and_modify(|state| *state = DataChunkState::Ready(expected_data_chunk().into()));
-
-            println!("{:?}", data_chunks.get(CHUNK_ID));
-        }
+        // Give pending spawned tasks a chance to be polled
+        tokio::task::yield_now().await;
 
         let expected = expected_data_chunk();
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), Some(expected).as_ref());

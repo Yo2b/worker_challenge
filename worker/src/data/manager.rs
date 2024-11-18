@@ -3,6 +3,7 @@ use std::ops::Deref;
 use std::sync::{Arc, RwLock};
 
 use futures::future::AbortHandle;
+use tokio::sync::Notify;
 
 use super::*;
 
@@ -11,12 +12,13 @@ use super::*;
 #[allow(clippy::identity_op)]
 const DEFAULT_CAPACITY: usize = 1 * 1_024 * 1_024 / 200;
 const POOL_SIZE: NonZeroU8 = unsafe { NonZeroU8::new_unchecked(10) };
+const TEMP_EXT: &str = "tmp";
 
 /// Worker's data chunk state.
 #[derive(Debug)]
 enum DataChunkState {
     Downloading(Option<Box<(DataChunk, AbortHandle)>>),
-    Ready(Arc<DataChunk>),
+    Ready(Arc<(DataChunk, Notify)>),
 }
 
 /// Worker's data manager.
@@ -24,6 +26,7 @@ enum DataChunkState {
 pub struct WorkerDataManager {
     data_dir: PathBuf,
     data_chunks: Arc<RwLock<HashMap<ChunkId, DataChunkState>>>,
+    // download_manager: crate::download::Manager,
     pool: crate::task::Pool,
 }
 
@@ -61,10 +64,29 @@ impl DataManager for WorkerDataManager {
             self.data_chunks.write().unwrap().entry(chunk.id).or_insert_with(|| {
                 let data_chunks = Arc::clone(&self.data_chunks);
 
-                let (remote_handle, abort_handle) = self.pool.execute(async move {
-                    // TODO: download chunk
+                let path = self.chunk_path(&chunk);
+                let files = chunk.files.clone();
 
-                    // chunk can still be canceled while awaiting for a write access
+                let (remote_handle, abort_handle) = self.pool.execute(async move {
+                    tracing::debug!("Downloading data chunk to local storage: `{}`", path.display());
+
+                    // let path = path.canonicalize()?;
+                    let tmp = path.with_extension(TEMP_EXT);
+
+                    tokio::fs::create_dir_all(&tmp).await?;
+
+                    // TODO: write chunk descriptor (file names with their associated HTTP URL) to local storage
+
+                    let manager = crate::download::Manager::new(tmp);
+                    manager.batch_download(files).await?;
+                    // manager.pool_download(files).await?;
+
+                    tokio::fs::rename(manager.path(), &path).await?;
+
+                    tracing::debug!("Downloaded data chunk to local storage: `{}`", path.display());
+
+                    // chunk can still be canceled while awaiting for a write access,
+                    // in which case entry has been removed otherwise it can be granted to ready state
                     let canceled = data_chunks
                         .write()
                         .unwrap()
@@ -75,18 +97,22 @@ impl DataManager for WorkerDataManager {
 
                                 debug_assert!(!handle.is_aborted());
 
-                                *state = DataChunkState::Ready(Arc::new(chunk));
+                                *state = DataChunkState::Ready(Arc::new((chunk, Notify::new())));
                             }
                             _ => unreachable!(),
                         })
                         .is_none();
 
                     if canceled {
-                        todo!("delete canceled {:?}", chunk.id)
+                        tracing::debug!("Deleting canceled data chunk from local storage: `{}`", path.display());
+
+                        tokio::fs::remove_dir_all(&path).await?;
                     }
+
+                    Ok::<_, crate::download::Error>(())
                 });
 
-                remote_handle.forget();
+                remote_handle.forget(); // forget remote handle for now but should be used to deal with errors
 
                 DataChunkState::Downloading(Some(Box::new((chunk, abort_handle))))
             });
@@ -100,8 +126,11 @@ impl DataManager for WorkerDataManager {
     #[allow(refining_impl_trait_reachable)]
     fn find_chunk(&self, dataset_id: DatasetId, block_number: u64) -> Option<impl DataChunkRef + Deref<Target = DataChunk>> {
         self.data_chunks.read().unwrap().values().find_map(|state| match state {
-            DataChunkState::Ready(chunk) if chunk.dataset_id == dataset_id && chunk.block_range.contains(&block_number) => {
-                Some(WorkerDataChunkRef(self.chunk_path(chunk), Arc::clone(chunk)))
+            DataChunkState::Ready(ctx) if ctx.0.dataset_id == dataset_id && ctx.0.block_range.contains(&block_number) => {
+                Some(WorkerDataChunkRef {
+                    path: self.chunk_path(&ctx.0),
+                    ctx: Arc::clone(ctx),
+                })
             }
             _ => None,
         })
@@ -121,10 +150,37 @@ impl DataManager for WorkerDataManager {
 
                     handle.abort();
 
-                    self.pool.forget(async move { todo!("delete incomplete {chunk:?}") });
+                    let mut path = self.chunk_path(&chunk);
+                    path.set_extension(TEMP_EXT);
+
+                    self.pool.forget(async move {
+                        tracing::debug!("Aborting data chunk download to local storage: `{}`", path.display());
+
+                        // delete incomplete chunk
+                        let _ = tokio::fs::remove_dir_all(&path).await;
+                    });
                 }
-                Some(DataChunkState::Ready(chunk)) => {
-                    self.pool.forget(async move { todo!("delete {chunk:?}") });
+                Some(DataChunkState::Ready(ctx)) => {
+                    // turn this chunk ctx in at least 2 chunk refs
+                    let chunk_ref = WorkerDataChunkRef {
+                        path: self.chunk_path(&ctx.0),
+                        ctx,
+                    };
+                    let _chunk_ref = chunk_ref.clone();
+
+                    // conveniently reuse pool to achieve task for now but it could flood the pool
+                    // if too many deletion are required while keeping unreleased chunk refs
+                    self.pool.forget(async move {
+                        tracing::debug!("Waiting data chunk refs for local storage: `{}`", chunk_ref.path().display());
+
+                        // wait for the last chunk ref to be released
+                        chunk_ref.ctx.1.notified().await;
+
+                        tracing::debug!("Deleting data chunk from local storage: `{}`", chunk_ref.path().display());
+
+                        // delete chunk
+                        let _ = tokio::fs::remove_dir_all(chunk_ref.path()).await;
+                    });
                 }
                 None => { /* entry has already been removed in the meantime */ }
             }
@@ -137,6 +193,7 @@ impl WorkerDataManager {
         Self {
             data_dir,
             data_chunks: Arc::new(RwLock::new(HashMap::with_capacity(DEFAULT_CAPACITY))),
+            // download_manager: crate::download::Manager::default(),
             pool: crate::task::Pool::default(),
         }
     }
@@ -182,18 +239,24 @@ impl WorkerDataManager {
                 let chunk_id = entry.file_name();
                 let chunk_dir = entry.path();
 
-                tracing::trace!("Read data chunk {chunk_id:?} from local storage: `{}`", chunk_dir.display());
+                if chunk_dir.extension().is_some_and(|ext| ext == TEMP_EXT) {
+                    tracing::trace!("Clean incomplete chunk from local storage: `{}`", chunk_dir.display());
 
-                let chunk_files = vec![];
+                    std::fs::remove_dir_all(chunk_dir)?;
+                } else {
+                    tracing::trace!("Read data chunk {chunk_id:?} from local storage: `{}`", chunk_dir.display());
 
-                // TODO: read chunk descriptor (file names with their associated HTTP URL) from local storage
-                // TODO: ultimately check chunk completeness and integrity of stored files
+                    let chunk_files = vec![];
 
-                let chunk = Self::data_chunk(&chunk_id)?.with_files(chunk_files);
+                    // TODO: read chunk descriptor (file names with their associated HTTP URL) from local storage
+                    // TODO: ultimately check chunk completeness and integrity of stored files
 
-                tracing::trace!("Found data chunk {chunk:?} from local storage: `{}`", chunk_dir.display());
+                    let chunk = Self::data_chunk(&chunk_id)?.with_files(chunk_files);
 
-                chunks.push((chunk_dir, chunk));
+                    tracing::trace!("Found data chunk {chunk:?} from local storage: `{}`", chunk_dir.display());
+
+                    chunks.push((chunk_dir, chunk));
+                }
             }
         }
 
@@ -203,21 +266,32 @@ impl WorkerDataManager {
 
 /// Worker's data chunk reference.
 #[derive(Debug, Clone)]
-pub struct WorkerDataChunkRef(PathBuf, Arc<DataChunk>);
+pub struct WorkerDataChunkRef {
+    path: PathBuf,
+    ctx: Arc<(DataChunk, Notify)>,
+}
 
 impl Deref for WorkerDataChunkRef {
     type Target = DataChunk;
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.1
+        &self.ctx.0
     }
 }
 
 impl DataChunkRef for WorkerDataChunkRef {
     #[inline]
     fn path(&self) -> &Path {
-        &self.0
+        &self.path
+    }
+}
+
+impl Drop for WorkerDataChunkRef {
+    fn drop(&mut self) {
+        if Arc::strong_count(&self.ctx) == 1 {
+            self.ctx.1.notify_one();
+        }
     }
 }
 
@@ -234,9 +308,10 @@ mod tests {
 
         print_size_of::<WorkerDataManager>();
         print_size_of::<AbortHandle>();
+        print_size_of::<Notify>();
         print_size_of::<DataChunk>();
         print_size_of::<Option<Box<(DataChunk, AbortHandle)>>>();
-        print_size_of::<Arc<DataChunk>>();
+        print_size_of::<Arc<(DataChunk, Notify)>>();
         print_size_of::<ChunkId>();
 
         println!(
@@ -310,8 +385,7 @@ mod tests {
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), None);
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_OUT).as_deref(), None);
 
-        // Give pending spawned tasks a chance to be polled
-        tokio::task::yield_now().await;
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         let expected = expected_data_chunk();
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), Some(expected).as_ref());
@@ -323,6 +397,8 @@ mod tests {
 
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), None);
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_OUT).as_deref(), None);
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
         drop(manager);
 

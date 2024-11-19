@@ -17,20 +17,40 @@ const TEMP_EXT: &str = "tmp";
 /// Worker's data chunk state.
 #[derive(Debug)]
 enum DataChunkState {
+    /// Downloading state.
+    ///
+    /// When requesting for a data chunk download, this entry state is added to the in-memory [`HashMap`] cache for the associated `chunk.id` key.
+    /// The state context is made of the `DataChunk` description and an `AbortHandle` on the task in the pool.
     Downloading(Option<Box<(DataChunk, AbortHandle)>>),
+    /// Ready state.
+    ///
+    /// When completing a data chunk download or reading a data chunk from the local storage, this entry state is added or replaced in-place in the
+    /// in-memory [`HashMap`] cache for the associated `chunk.id` key. The state context is made of the originally owned `DataChunk` wrapped in the
+    /// first `WorkerDataChunkRef`.
     Ready(WorkerDataChunkRef),
 }
 
 /// Worker's data manager.
+///
+/// A task orchestrator managing existing data chunks, downloading new ones and storing them to a local storage.
+/// It implements the [`DataManager`] trait, handles [`DataChunk`] structs and returns [`DataChunkRef`] trait implementors.
 #[derive(Debug)]
 pub struct WorkerDataManager {
+    /// The path to store the data in the local storage.
     data_dir: PathBuf,
+    /// An in-memory `HashMap` cache protected for concurrent R/W access for managed `chunk.id` keys and their associated `DataChunk` description.
     data_chunks: Arc<RwLock<HashMap<ChunkId, DataChunkState>>>,
+    // /// A manager to download files in the background.
     // download_manager: crate::download::Manager,
+    /// A pool to manage tasks in the background.
     pool: crate::task::Pool,
 }
 
 impl DataManager for WorkerDataManager {
+    /// Create a fully "initialized" `WorkerDataManager` instance.
+    ///
+    /// It is "initialized" in the way that its in-memory [`HashMap`] cache is populated with data chunks existing in the local storage
+    /// and its task [`Pool`](crate::task::Pool) has been started to accept pending tasks.
     fn new(data_dir: PathBuf) -> Self {
         let mut manager = Self::new_uninit(data_dir);
 
@@ -54,6 +74,7 @@ impl DataManager for WorkerDataManager {
         manager
     }
 
+    /// Schedule `chunk` download in background.
     fn download_chunk(&self, chunk: DataChunk) {
         let data_chunks = self.data_chunks.read().unwrap();
 
@@ -119,10 +140,15 @@ impl DataManager for WorkerDataManager {
         }
     }
 
+    /// List chunks that are currently available.
     fn list_chunks(&self) -> Vec<ChunkId> {
         self.data_chunks.read().unwrap().keys().cloned().collect()
     }
 
+    /// Find a chunk from a given dataset, that is responsible for `block_number`.
+    ///
+    /// This trait method implementation refines the initial trait constraints on the returned type so that it can be coerced to its underlying
+    /// [`DataChunk`] when dereferencing.
     #[allow(refining_impl_trait_reachable)]
     fn find_chunk(&self, dataset_id: DatasetId, block_number: u64) -> Option<impl DataChunkRef + Deref<Target = DataChunk>> {
         self.data_chunks.read().unwrap().values().find_map(|state| match state {
@@ -133,6 +159,7 @@ impl DataManager for WorkerDataManager {
         })
     }
 
+    /// Schedule data chunk for deletion in background.
     fn delete_chunk(&self, chunk_id: ChunkId) {
         let data_chunks = self.data_chunks.read().unwrap();
 
@@ -182,6 +209,10 @@ impl DataManager for WorkerDataManager {
 }
 
 impl WorkerDataManager {
+    /// Create a new "uninitialized" `WorkerDataManager` instance.
+    ///
+    /// It is "uninitialized" in the way that neither its in-memory [`HashMap`] cache is populated with data chunks existing in the local storage
+    /// nor its task [`Pool`](crate::task::Pool) has been started to accept pending tasks.
     fn new_uninit(data_dir: PathBuf) -> Self {
         Self {
             data_dir,
@@ -191,6 +222,7 @@ impl WorkerDataManager {
         }
     }
 
+    /// Return the expected path in the local storage related to this data chunk.
     fn chunk_path(&self, chunk: &DataChunk) -> PathBuf {
         let chunk_id = [
             utils::encode_id(&chunk.id),
@@ -203,6 +235,7 @@ impl WorkerDataManager {
         self.data_dir.join(chunk_id)
     }
 
+    /// Return the expected data chunk related to this path in the local storage.
     fn data_chunk(chunk_id: &std::ffi::OsStr) -> std::io::Result<DataChunk> {
         let chunk_id = chunk_id.to_str().ok_or(std::io::ErrorKind::InvalidInput)?;
         match chunk_id.splitn(4, "_").collect::<Vec<_>>()[..] {
@@ -217,6 +250,7 @@ impl WorkerDataManager {
         }
     }
 
+    /// Walk through the local storage and return all valid data chunk stored in it.
     fn walk_dir(data_dir: &Path) -> std::io::Result<Vec<(PathBuf, DataChunk)>> {
         if !data_dir.is_dir() {
             return Err(std::io::ErrorKind::InvalidInput)?;
@@ -258,8 +292,10 @@ impl WorkerDataManager {
 }
 
 /// Worker's data chunk reference.
+///
+/// A data chunk remains available and untouched until this reference is dropped.
 #[derive(Debug, Clone)]
-pub struct WorkerDataChunkRef {
+struct WorkerDataChunkRef {
     ctx: Arc<(PathBuf, DataChunk, Notify)>,
 }
 

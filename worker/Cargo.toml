@@ -18,4 +18,5 @@ url.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+tokio-test.workspace = true
 tracing-test.workspace = true

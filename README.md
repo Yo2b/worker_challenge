@@ -50,7 +50,7 @@ It is mainly composed of:
 - A `data::WorkerDataManager` task orchestrator managing existing data chunks, downloading new ones and storing them to a local storage. It strictly implements the imposed `DataManager` trait, handles `DataChunk` structs and returns `DataChunkRef` trait implementors.
 - A scalable, generic and widely reusable `task::Pool` to deal with asynchronous tasks in the background:
   - Tasks can just be pushed and forgotten using `task::Pool::forget()` method (tasks must return `()`).
-  - Tasks can be pushed while still keeping both a remote handle on a task result on completion and an abortable handle to cancel a task using `task::Pool::execute()` method (tasks can return any `T: Send`). If you're just interested in the abortable handle part, the remote handle part can still be released as simply as using `remote_handle.forget()`, letting the task complete in the background. Be aware that if you just drop the remote handle, it will automatically cancel the task. To retrieve a task result on completion, just await on the remote handle with `let res: Result<T, Aborted> = remote_handle.await;`. To cancel a task, just call `abort_handle.abort()` on the abortable handle. The remote handle part will then return an `Err(Aborted)` on its side.
+  - Tasks can be pushed while still keeping both a remote handle on a task result on completion and an abortable handle to cancel a task using `task::Pool::execute()` method (tasks can return any `T: Send`).
 - An asynchronous HTTP-based `download::Manager` to deal with downloading data chunk files. It can handle concurrent downloads:
   - either on the same pool task using `download::Manager::batch_download()` method,
   - or on a dedicated pool using `download::Manager::pool_download()` method.
@@ -82,7 +82,7 @@ The crates in this workspace may rely on other renowned, widely tried and tested
       - colliding cleaning task
 
 ## Improvements
-- Add more doc comments and unit tests, as well as full test data sets.
+- Add more ~~doc comments and~~ unit tests, as well as full test data sets.
 - Properly finalize `task::Pool` when dropped.
 - Fix data chunk deletion after all data chunk references have been dropped.
 - Manage I/O errors, HTTP errors, data chunk errors... and deal with HTTP retries.

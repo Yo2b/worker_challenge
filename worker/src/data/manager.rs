@@ -18,7 +18,7 @@ const TEMP_EXT: &str = "tmp";
 #[derive(Debug)]
 enum DataChunkState {
     Downloading(Option<Box<(DataChunk, AbortHandle)>>),
-    Ready(Arc<(DataChunk, Notify)>),
+    Ready(WorkerDataChunkRef),
 }
 
 /// Worker's data manager.
@@ -44,7 +44,7 @@ impl DataManager for WorkerDataManager {
 
             let chunks = chunks
                 .into_iter()
-                .map(|(_, chunk)| (chunk.id, DataChunkState::Ready(Arc::new(chunk))));
+                .map(|(path, chunk)| (chunk.id, DataChunkState::Ready(WorkerDataChunkRef::new(path, chunk))));
 
             data_chunks.extend(chunks);
         }
@@ -97,7 +97,7 @@ impl DataManager for WorkerDataManager {
 
                                 debug_assert!(!handle.is_aborted());
 
-                                *state = DataChunkState::Ready(Arc::new((chunk, Notify::new())));
+                                *state = DataChunkState::Ready(WorkerDataChunkRef::new(path.clone(), chunk));
                             }
                             _ => unreachable!(),
                         })
@@ -126,11 +126,8 @@ impl DataManager for WorkerDataManager {
     #[allow(refining_impl_trait_reachable)]
     fn find_chunk(&self, dataset_id: DatasetId, block_number: u64) -> Option<impl DataChunkRef + Deref<Target = DataChunk>> {
         self.data_chunks.read().unwrap().values().find_map(|state| match state {
-            DataChunkState::Ready(ctx) if ctx.0.dataset_id == dataset_id && ctx.0.block_range.contains(&block_number) => {
-                Some(WorkerDataChunkRef {
-                    path: self.chunk_path(&ctx.0),
-                    ctx: Arc::clone(ctx),
-                })
+            DataChunkState::Ready(chunk_ref) if chunk_ref.dataset_id == dataset_id && chunk_ref.block_range.contains(&block_number) => {
+                Some(chunk_ref.clone())
             }
             _ => None,
         })
@@ -160,12 +157,8 @@ impl DataManager for WorkerDataManager {
                         let _ = tokio::fs::remove_dir_all(&path).await;
                     });
                 }
-                Some(DataChunkState::Ready(ctx)) => {
-                    // turn this chunk ctx in at least 2 chunk refs
-                    let chunk_ref = WorkerDataChunkRef {
-                        path: self.chunk_path(&ctx.0),
-                        ctx,
-                    };
+                Some(DataChunkState::Ready(chunk_ref)) => {
+                    // get at least 2 chunk refs
                     let _chunk_ref = chunk_ref.clone();
 
                     // conveniently reuse pool to achieve task for now but it could flood the pool
@@ -174,7 +167,7 @@ impl DataManager for WorkerDataManager {
                         tracing::debug!("Waiting data chunk refs for local storage: `{}`", chunk_ref.path().display());
 
                         // wait for the last chunk ref to be released
-                        chunk_ref.ctx.1.notified().await;
+                        chunk_ref.ctx.2.notified().await;
 
                         tracing::debug!("Deleting data chunk from local storage: `{}`", chunk_ref.path().display());
 
@@ -267,8 +260,15 @@ impl WorkerDataManager {
 /// Worker's data chunk reference.
 #[derive(Debug, Clone)]
 pub struct WorkerDataChunkRef {
-    path: PathBuf,
-    ctx: Arc<(DataChunk, Notify)>,
+    ctx: Arc<(PathBuf, DataChunk, Notify)>,
+}
+
+impl WorkerDataChunkRef {
+    fn new(path: PathBuf, chunk: DataChunk) -> Self {
+        Self {
+            ctx: Arc::new((path, chunk, Notify::new())),
+        }
+    }
 }
 
 impl Deref for WorkerDataChunkRef {
@@ -276,21 +276,21 @@ impl Deref for WorkerDataChunkRef {
 
     #[inline]
     fn deref(&self) -> &Self::Target {
-        &self.ctx.0
+        &self.ctx.1
     }
 }
 
 impl DataChunkRef for WorkerDataChunkRef {
     #[inline]
     fn path(&self) -> &Path {
-        &self.path
+        &self.ctx.0
     }
 }
 
 impl Drop for WorkerDataChunkRef {
     fn drop(&mut self) {
         if Arc::strong_count(&self.ctx) == 1 {
-            self.ctx.1.notify_one();
+            self.ctx.2.notify_one();
         }
     }
 }
@@ -311,7 +311,7 @@ mod tests {
         print_size_of::<Notify>();
         print_size_of::<DataChunk>();
         print_size_of::<Option<Box<(DataChunk, AbortHandle)>>>();
-        print_size_of::<Arc<(DataChunk, Notify)>>();
+        print_size_of::<WorkerDataChunkRef>();
         print_size_of::<ChunkId>();
 
         println!(

@@ -161,10 +161,8 @@ impl Pool {
         let _ = self.sender.take().as_ref().map(mpsc::UnboundedSender::downgrade);
         let workers = std::mem::take(&mut self.workers);
 
-        future::join_all(workers.into_iter().map(|worker| {
+        future::join_all(workers.into_iter().inspect(|worker| {
             tracing::debug!("Stopping worker {}...", worker.id);
-
-            worker.handle
         }))
         .await;
     }
@@ -174,17 +172,6 @@ impl Pool {
     /// Once closed, the pool cannot be used since it is consumed.
     pub async fn close(mut self) {
         self.stop().await
-    }
-}
-
-impl Drop for Pool {
-    fn drop(&mut self) {
-        tracing::debug!("Dropping pool...");
-
-        // futures::executor::block_on(self.stop())
-        // tokio::task::block_in_place(|| {
-        //     tokio::runtime::Handle::current().block_on(self.stop())
-        // })
     }
 }
 
@@ -221,11 +208,11 @@ impl Worker {
     }
 }
 
-// impl Future for Worker {
-//     type Output = Result<(), tokio::task::JoinError>;
+impl Future for Worker {
+    type Output = Result<(), tokio::task::JoinError>;
 
-//     #[inline]
-//     fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
-//         self.handle.poll_unpin(cx)
-//     }
-// }
+    #[inline]
+    fn poll(mut self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        self.handle.poll_unpin(cx)
+    }
+}

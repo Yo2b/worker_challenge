@@ -291,6 +291,15 @@ impl WorkerDataManager {
     }
 }
 
+impl Drop for WorkerDataManager {
+    fn drop(&mut self) {
+        // futures::executor::block_on(self.pool.stop());
+        // // tokio::task::block_in_place(|| {
+        // //     tokio::runtime::Handle::current().block_on(self.pool.stop());
+        // // })
+    }
+}
+
 /// Worker's data chunk reference.
 ///
 /// A data chunk remains available and untouched until this reference is dropped.
@@ -436,8 +445,8 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
+        println!("Dropping manager...");
         drop(manager);
-
         println!("Manager dropped!");
     }
 }

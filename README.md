@@ -83,7 +83,7 @@ The crates in this workspace may rely on other renowned, widely tried and tested
 
 ## Improvements
 - Add more ~~doc comments and~~ unit tests, as well as full test data sets.
-- Properly finalize `task::Pool` when dropped.
+- Properly finalize `task::Pool` when `WorkerDataManager` is dropped.
 - Fix data chunk deletion after all data chunk references have been dropped.
 - Manage I/O errors, HTTP errors, data chunk errors... and deal with HTTP retries.
 - Implement `serde` (de)serialization traits for `DataChunk` type and read/write data chunk descriptors to local storage.

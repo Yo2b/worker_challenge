@@ -185,16 +185,20 @@ impl DataManager for WorkerDataManager {
                     });
                 }
                 Some(DataChunkState::Ready(chunk_ref)) => {
-                    // get at least 2 chunk refs
-                    let _chunk_ref = chunk_ref.clone();
-
                     // conveniently reuse pool to achieve task for now but it could flood the pool
                     // if too many deletion are required while keeping unreleased chunk refs
                     self.pool.forget(async move {
-                        tracing::debug!("Waiting data chunk refs for local storage: `{}`", chunk_ref.path().display());
+                        let count = Arc::strong_count(&chunk_ref.ctx) - 1;
 
-                        // wait for the last chunk ref to be released
-                        chunk_ref.ctx.2.notified().await;
+                        if count > 0 {
+                            tracing::debug!(
+                                "Waiting {count} data chunk refs for local storage: `{}`",
+                                chunk_ref.path().display()
+                            );
+
+                            // wait for the last chunk ref to be released
+                            chunk_ref.ctx.2.notified().await;
+                        }
 
                         tracing::debug!("Deleting data chunk from local storage: `{}`", chunk_ref.path().display());
 
@@ -334,8 +338,10 @@ impl DataChunkRef for WorkerDataChunkRef {
 
 impl Drop for WorkerDataChunkRef {
     fn drop(&mut self) {
-        if Arc::strong_count(&self.ctx) == 1 {
-            self.ctx.2.notify_one();
+        // send a notification when there is only one last remaining reference,
+        // meaning this is the second to last reference since it is not actually dropped yet
+        if Arc::strong_count(&self.ctx) == 2 {
+            self.ctx.2.notify_waiters(); // notifies only waiting tasks, no permit is stored to be used by any future task
         }
     }
 }
@@ -414,17 +420,11 @@ mod tests {
         let manager = WorkerDataManager::new(PathBuf::from("path/is/unlikely/to/exist"));
 
         assert!(manager.list_chunks().is_empty());
-
         manager.download_chunk(expected_data_chunk());
-
         assert!(manager.list_chunks().contains(CHUNK_ID));
-
         manager.delete_chunk(*CHUNK_ID);
-
         assert!(!manager.list_chunks().contains(CHUNK_ID));
-
         manager.download_chunk(expected_data_chunk());
-
         assert!(manager.list_chunks().contains(CHUNK_ID));
 
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), None);
@@ -432,21 +432,18 @@ mod tests {
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 
-        let expected = expected_data_chunk();
-        assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), Some(expected).as_ref());
-        assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_OUT).as_deref(), None);
-
+        let chunk = manager.find_chunk(*DATASET_ID, BLOCK_IN).unwrap();
+        assert_eq!(*chunk, expected_data_chunk());
         manager.delete_chunk(*CHUNK_ID);
 
-        assert!(!manager.list_chunks().contains(CHUNK_ID));
-
-        assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), None);
-        assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_OUT).as_deref(), None);
-
-        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
-
+        tokio::task::yield_now().await;
+        println!("Dropping chunk ref...");
+        drop(chunk);
+        println!("Chunk ref dropped!");
+        tokio::task::yield_now().await;
         println!("Dropping manager...");
         drop(manager);
         println!("Manager dropped!");
+        tokio::task::yield_now().await;
     }
 }

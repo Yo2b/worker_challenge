@@ -43,7 +43,7 @@ pub struct WorkerDataManager {
     // /// A manager to download files in the background.
     // download_manager: crate::download::Manager,
     /// A pool to manage tasks in the background.
-    pool: crate::task::Pool,
+    task_pool: crate::task::Pool,
 }
 
 impl DataManager for WorkerDataManager {
@@ -69,7 +69,7 @@ impl DataManager for WorkerDataManager {
             data_chunks.extend(chunks);
         }
 
-        manager.pool.start(POOL_SIZE);
+        manager.task_pool.start(POOL_SIZE);
 
         manager
     }
@@ -88,7 +88,7 @@ impl DataManager for WorkerDataManager {
                 let path = self.chunk_path(&chunk);
                 let files = chunk.files.clone();
 
-                let (remote_handle, abort_handle) = self.pool.execute(async move {
+                let (remote_handle, abort_handle) = self.task_pool.execute(async move {
                     tracing::debug!("Downloading data chunk to local storage: `{}`", path.display());
 
                     // let path = path.canonicalize()?;
@@ -177,7 +177,7 @@ impl DataManager for WorkerDataManager {
                     let mut path = self.chunk_path(&chunk);
                     path.set_extension(TEMP_EXT);
 
-                    self.pool.forget(async move {
+                    self.task_pool.forget(async move {
                         tracing::debug!("Aborting data chunk download to local storage: `{}`", path.display());
 
                         // delete incomplete chunk
@@ -187,7 +187,7 @@ impl DataManager for WorkerDataManager {
                 Some(DataChunkState::Ready(chunk_ref)) => {
                     // conveniently reuse pool to achieve task for now but it could flood the pool
                     // if too many deletion are required while keeping unreleased chunk refs
-                    self.pool.forget(async move {
+                    self.task_pool.forget(async move {
                         let count = Arc::strong_count(&chunk_ref.ctx) - 1;
 
                         if count > 0 {
@@ -222,7 +222,7 @@ impl WorkerDataManager {
             data_dir,
             data_chunks: Arc::new(RwLock::new(HashMap::with_capacity(DEFAULT_CAPACITY))),
             // download_manager: crate::download::Manager::default(),
-            pool: crate::task::Pool::default(),
+            task_pool: crate::task::Pool::default(),
         }
     }
 

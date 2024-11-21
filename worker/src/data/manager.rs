@@ -358,11 +358,12 @@ mod tests {
         }
 
         print_size_of::<WorkerDataManager>();
-        print_size_of::<AbortHandle>();
-        print_size_of::<Notify>();
-        print_size_of::<DataChunk>();
-        print_size_of::<Option<Box<(DataChunk, AbortHandle)>>>();
         print_size_of::<WorkerDataChunkRef>();
+        print_size_of::<DataChunkState>();
+        print_size_of::<DataChunk>();
+        print_size_of::<Notify>();
+        print_size_of::<AbortHandle>();
+        print_size_of::<Option<Box<(DataChunk, AbortHandle)>>>();
         print_size_of::<ChunkId>();
 
         println!(
@@ -414,10 +415,10 @@ mod tests {
         assert_eq!(chunk, expected_data_chunk());
     }
 
-    #[tokio::test/* (flavor = "multi_thread") */]
+    #[test]
     #[tracing_test::traced_test]
-    async fn test_data_manager() {
-        let manager = WorkerDataManager::new(PathBuf::from("path/is/unlikely/to/exist"));
+    fn test_data_manager_uninit() {
+        let manager = WorkerDataManager::new_uninit(PathBuf::from("path/is/unlikely/to/exist"));
 
         assert!(manager.list_chunks().is_empty());
         manager.download_chunk(expected_data_chunk());
@@ -429,6 +430,37 @@ mod tests {
 
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), None);
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_OUT).as_deref(), None);
+    }
+
+    #[tokio::test/* (flavor = "multi_thread") */]
+    #[tracing_test::traced_test]
+    async fn test_data_manager_download() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let manager = WorkerDataManager::new(temp.path().to_path_buf());
+
+        manager.download_chunk(expected_data_chunk());
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let expected = expected_data_chunk();
+        assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), Some(expected).as_ref());
+
+        tokio::task::yield_now().await;
+        println!("Dropping manager...");
+        drop(manager);
+        println!("Manager dropped!");
+        tokio::task::yield_now().await;
+    }
+
+    #[tokio::test/* (flavor = "multi_thread") */]
+    #[tracing_test::traced_test]
+    async fn test_data_manager_delete() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let manager = WorkerDataManager::new(temp.path().to_path_buf());
+
+        manager.download_chunk(expected_data_chunk());
 
         tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
 

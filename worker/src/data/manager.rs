@@ -142,7 +142,7 @@ impl DataManager for WorkerDataManager {
 
     /// List chunks that are currently available.
     fn list_chunks(&self) -> Vec<ChunkId> {
-        self.data_chunks.read().unwrap().keys().cloned().collect()
+        self.data_chunks.read().unwrap().keys().copied().collect()
     }
 
     /// Find a chunk from a given dataset, that is responsible for `block_number`.

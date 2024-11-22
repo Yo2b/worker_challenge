@@ -293,6 +293,15 @@ impl WorkerDataManager {
 
         Ok(chunks)
     }
+
+    /// Gracefully close this `WorkerDataManager`.
+    ///
+    /// It waits for the task pool to complete all its pending tasks.
+    pub async fn close(mut self) {
+        tracing::trace!("Closing task pool...");
+        self.task_pool.stop().await;
+        tracing::trace!("Task pool closed.");
+    }
 }
 
 impl Drop for WorkerDataManager {
@@ -446,11 +455,9 @@ mod tests {
         let expected = expected_data_chunk();
         assert_eq!(manager.find_chunk(*DATASET_ID, BLOCK_IN).as_deref(), Some(expected).as_ref());
 
-        tokio::task::yield_now().await;
         println!("Dropping manager...");
-        drop(manager);
+        manager.close().await;
         println!("Manager dropped!");
-        tokio::task::yield_now().await;
     }
 
     #[tokio::test/* (flavor = "multi_thread") */]
@@ -469,13 +476,15 @@ mod tests {
         manager.delete_chunk(*CHUNK_ID);
 
         tokio::task::yield_now().await;
+
         println!("Dropping chunk ref...");
         drop(chunk);
         println!("Chunk ref dropped!");
+
         tokio::task::yield_now().await;
+
         println!("Dropping manager...");
-        drop(manager);
+        manager.close().await;
         println!("Manager dropped!");
-        tokio::task::yield_now().await;
     }
 }

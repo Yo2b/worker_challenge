@@ -1,11 +1,13 @@
 use std::num::NonZeroU8;
 use std::ops::Deref;
-use std::sync::{Arc, RwLock};
+use std::sync::{Arc, Mutex, RwLock};
 
 use futures::future::AbortHandle;
-use tokio::sync::Notify;
+use tokio::sync::{mpsc, Notify};
 
 use super::*;
+
+type DeletionSender = mpsc::UnboundedSender<PathBuf>;
 
 // > Each chunk has approximate size of 200 MB and each worker can store up to 1 TB of data on disk.
 // This could be mitigated to reserve capacity for less entries by default and allow more frequent dynamic reallocation.
@@ -44,6 +46,10 @@ pub struct WorkerDataManager {
     // download_manager: crate::download::Manager,
     /// A pool to manage tasks in the background.
     task_pool: crate::task::Pool,
+    /// A data channel to send data chunk paths in the local storage for background deletion
+    deletion_sender: Option<DeletionSender>,
+    /// A control channel to notify the deletion channel to stop accepting data chunk paths
+    deletion_notify: Arc<Notify>,
 }
 
 impl DataManager for WorkerDataManager {
@@ -69,7 +75,44 @@ impl DataManager for WorkerDataManager {
             data_chunks.extend(chunks);
         }
 
+        tracing::debug!("Initiate task pool.");
+
         manager.task_pool.start(POOL_SIZE);
+
+        tracing::debug!("Initiate deletion channel.");
+
+        let notify = Arc::clone(&manager.deletion_notify);
+        let (sender, mut receiver) = mpsc::unbounded_channel();
+        manager.deletion_sender.replace(sender);
+
+        // conveniently reuse task pool to achieve deletion tasks
+        manager.task_pool.forget(async move {
+            tracing::debug!("Deletion channel started.");
+
+            loop {
+                tokio::select! {
+                    // biased;
+
+                    _ = notify.notified(), if !receiver.is_closed() => {
+                        receiver.close();
+                        tracing::trace!("Deletion channel closed.");
+                    }
+
+                    Some(path) = receiver.recv() => {
+                        tracing::debug!("Deleting data chunk from local storage: `{}`", path.display());
+
+                        // delete chunk
+                        let _ = tokio::fs::remove_dir_all(path).await;
+                    }
+
+                    else => {
+                        break;
+                    }
+                }
+            }
+
+            tracing::debug!("Deletion channel exhausted, shutting down.");
+        });
 
         manager
     }
@@ -177,34 +220,20 @@ impl DataManager for WorkerDataManager {
                     let mut path = self.chunk_path(&chunk);
                     path.set_extension(TEMP_EXT);
 
-                    self.task_pool.forget(async move {
-                        tracing::debug!("Aborting data chunk download to local storage: `{}`", path.display());
+                    tracing::debug!("Aborted data chunk download to local storage: `{}`", path.display());
 
-                        // delete incomplete chunk
-                        let _ = tokio::fs::remove_dir_all(&path).await;
-                    });
+                    // delete incomplete chunk
+                    if let Some(ref sender) = self.deletion_sender {
+                        sender.send(path).unwrap();
+                    }
                 }
                 Some(DataChunkState::Ready(chunk_ref)) => {
-                    // conveniently reuse pool to achieve task for now but it could flood the pool
-                    // if too many deletion are required while keeping unreleased chunk refs
-                    self.task_pool.forget(async move {
-                        let count = Arc::strong_count(&chunk_ref.ctx) - 1;
+                    tracing::debug!("Removing data chunk from local storage: `{}`", chunk_ref.path().display());
 
-                        if count > 0 {
-                            tracing::debug!(
-                                "Waiting {count} data chunk refs for local storage: `{}`",
-                                chunk_ref.path().display()
-                            );
+                    debug_assert!(self.deletion_sender.is_some());
 
-                            // wait for the last chunk ref to be released
-                            chunk_ref.ctx.2.notified().await;
-                        }
-
-                        tracing::debug!("Deleting data chunk from local storage: `{}`", chunk_ref.path().display());
-
-                        // delete chunk
-                        let _ = tokio::fs::remove_dir_all(chunk_ref.path()).await;
-                    });
+                    // postpone chunk deletion
+                    chunk_ref.notify(self.deletion_sender.clone());
                 }
                 None => { /* entry has already been removed in the meantime */ }
             }
@@ -223,6 +252,8 @@ impl WorkerDataManager {
             data_chunks: Arc::new(RwLock::new(HashMap::with_capacity(DEFAULT_CAPACITY))),
             // download_manager: crate::download::Manager::default(),
             task_pool: crate::task::Pool::default(),
+            deletion_notify: Arc::new(Notify::new()),
+            deletion_sender: None,
         }
     }
 
@@ -296,8 +327,12 @@ impl WorkerDataManager {
 
     /// Gracefully close this `WorkerDataManager`.
     ///
-    /// It waits for the task pool to complete all its pending tasks.
+    /// It closes the deletion channel and waits for the task pool to complete all its pending tasks.
     pub async fn close(mut self) {
+        tracing::trace!("Closing deletion channel...");
+        self.deletion_notify.notify_one();
+        tokio::task::yield_now().await;
+
         tracing::trace!("Closing task pool...");
         self.task_pool.stop().await;
         tracing::trace!("Task pool closed.");
@@ -318,14 +353,18 @@ impl Drop for WorkerDataManager {
 /// A data chunk remains available and untouched until this reference is dropped.
 #[derive(Debug, Clone)]
 struct WorkerDataChunkRef {
-    ctx: Arc<(PathBuf, DataChunk, Notify)>,
+    ctx: Arc<(PathBuf, DataChunk, Mutex<Option<DeletionSender>>)>,
 }
 
 impl WorkerDataChunkRef {
     fn new(path: PathBuf, chunk: DataChunk) -> Self {
         Self {
-            ctx: Arc::new((path, chunk, Notify::new())),
+            ctx: Arc::new((path, chunk, Mutex::new(None))),
         }
+    }
+
+    fn notify(&self, sender: Option<DeletionSender>) {
+        *self.ctx.2.lock().unwrap() = sender;
     }
 }
 
@@ -347,10 +386,18 @@ impl DataChunkRef for WorkerDataChunkRef {
 
 impl Drop for WorkerDataChunkRef {
     fn drop(&mut self) {
-        // send a notification when there is only one last remaining reference,
-        // meaning this is the second to last reference since it is not actually dropped yet
-        if Arc::strong_count(&self.ctx) == 2 {
-            self.ctx.2.notify_waiters(); // notifies only waiting tasks, no permit is stored to be used by any future task
+        if let Some(ctx) = Arc::get_mut(&mut self.ctx) {
+            // send a notification whenever this reference is the only remaining one
+            if let Some(sender) = ctx.2.get_mut().unwrap().take() {
+                let path = std::mem::take(&mut ctx.0);
+
+                tracing::trace!(
+                    "Sending data chunk path into deletion channel for local storage: `{}`",
+                    path.display()
+                );
+
+                sender.send(path).unwrap();
+            }
         }
     }
 }
@@ -370,6 +417,8 @@ mod tests {
         print_size_of::<WorkerDataChunkRef>();
         print_size_of::<DataChunkState>();
         print_size_of::<DataChunk>();
+        print_size_of::<PathBuf>();
+        print_size_of::<mpsc::UnboundedSender<PathBuf>>();
         print_size_of::<Notify>();
         print_size_of::<AbortHandle>();
         print_size_of::<Option<Box<(DataChunk, AbortHandle)>>>();
@@ -462,7 +511,29 @@ mod tests {
 
     #[tokio::test/* (flavor = "multi_thread") */]
     #[tracing_test::traced_test]
-    async fn test_data_manager_delete() {
+    async fn test_data_manager_delete_no_ref() {
+        let temp = tempfile::tempdir().unwrap();
+
+        let manager = WorkerDataManager::new(temp.path().to_path_buf());
+
+        manager.download_chunk(expected_data_chunk());
+
+        tokio::time::sleep(tokio::time::Duration::from_millis(100)).await;
+
+        let chunk = manager.find_chunk(*DATASET_ID, BLOCK_IN).unwrap();
+        assert_eq!(*chunk, expected_data_chunk());
+        drop(chunk);
+
+        manager.delete_chunk(*CHUNK_ID);
+
+        println!("Dropping manager...");
+        manager.close().await;
+        println!("Manager dropped!");
+    }
+
+    #[tokio::test/* (flavor = "multi_thread") */]
+    #[tracing_test::traced_test]
+    async fn test_data_manager_delete_one_ref() {
         let temp = tempfile::tempdir().unwrap();
 
         let manager = WorkerDataManager::new(temp.path().to_path_buf());

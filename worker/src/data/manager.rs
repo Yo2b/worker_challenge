@@ -7,7 +7,7 @@ use tokio::sync::{mpsc, Notify};
 
 use super::*;
 
-type DeletionSender = mpsc::UnboundedSender<PathBuf>;
+type DeletionSender = mpsc::Sender<PathBuf>;
 
 // > Each chunk has approximate size of 200 MB and each worker can store up to 1 TB of data on disk.
 // This could be mitigated to reserve capacity for less entries by default and allow more frequent dynamic reallocation.
@@ -83,7 +83,7 @@ impl DataManager for WorkerDataManager {
         tracing::debug!("Initiate deletion channel.");
 
         let notify = Arc::clone(&manager.deletion_notify);
-        let (sender, mut receiver) = mpsc::unbounded_channel();
+        let (sender, mut receiver) = mpsc::channel(100);
         manager.deletion_sender.replace(sender);
 
         // conveniently reuse task pool to achieve deletion tasks
@@ -225,7 +225,7 @@ impl DataManager for WorkerDataManager {
 
                     // delete incomplete chunk
                     if let Some(ref sender) = self.deletion_sender {
-                        sender.send(path).unwrap();
+                        sender.blocking_send(path).unwrap();
                     }
                 }
                 Some(DataChunkState::Ready(chunk_ref)) => {
@@ -397,7 +397,12 @@ impl Drop for WorkerDataChunkRef {
                     path.display()
                 );
 
-                sender.send(path).unwrap();
+                let handle = std::thread::spawn(move || {
+                    // should handle a timeout error here
+                    sender.blocking_send(path).unwrap();
+                });
+
+                handle.join().unwrap();
             }
         }
     }

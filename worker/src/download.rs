@@ -113,7 +113,10 @@ impl Manager {
     /// Concurrent downloads stop as soon as an error is raised.
     pub async fn pool_download(&self, files: HashMap<impl AsRef<Path>, impl IntoUrl>) -> Result<(), Error> {
         let mut pool = crate::task::Pool::default();
-        pool.start(CONCURRENT_DOWNLOADS.try_into().unwrap());
+        pool.start(
+            CONCURRENT_DOWNLOADS.try_into().unwrap(),
+            u16::min(100, files.len() as _).try_into().unwrap(),
+        );
 
         let mut handles = Vec::with_capacity(files.len());
 

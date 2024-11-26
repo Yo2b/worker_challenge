@@ -69,7 +69,7 @@ The crates in this workspace may rely on other renowned, widely tried and tested
 - The imposed traits will not be improved nor breaking-changed to strictly stick with the framework of this challenge (eg. some methods should better return a `Result`). Especially, the `DataManager` implementation will be kept synchronous code.
 - The `DataManager::new()` trait method implementation will only deal with loading chunk description and rely on stored data, without any additional check for completeness or data integrity.
 - Chunk descriptors (file names with their associated HTTP URLs) are not stored to local storage for now.
-- The `WorkerDataManager`'s pool is conveniently reused for now to achieve chunk deletion tasks, but it could flood the pool if too many deletions are required while keeping unreleased chunk references.
+- The `WorkerDataManager`'s pool is conveniently reused for now to achieve chunk deletion tasks, ~~but it could flood the pool if too many deletions are required while keeping unreleased chunk references~~.
 - Error handling is minimalist (ie. no download retries, some IO errors are ignored...).
 - _"Think about possibilities of receiving multiple download requests for the same chunk or chunk deletion request followed by immediate download."_:
   - Multiple download requests for the same chunk are considered only once, assuming that `(chunk_id, dataset_id, block_range)` tuples are unique.
@@ -83,8 +83,9 @@ The crates in this workspace may rely on other renowned, widely tried and tested
 
 ## Improvements
 - Add more ~~doc comments and~~ unit tests, as well as full test data sets.
-- Properly finalize `task::Pool` when `WorkerDataManager` is dropped.
+- ~~Properly finalize `task::Pool` when `WorkerDataManager` is dropped~~.
 - ~~Fix data chunk deletion after all data chunk references have been dropped~~.
+- Use dedicated temp directories for processing chunk downloads, eg. make them unique replacing `tmp` extension with timestamp- and/or random-based naming.
 - Manage I/O errors, HTTP errors, data chunk errors... and deal with HTTP retries.
 - Implement `serde` (de)serialization traits for `DataChunk` type and read/write data chunk descriptors to local storage.
 - Check for data integrity when reading/writing to local data storage.

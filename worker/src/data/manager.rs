@@ -1,4 +1,4 @@
-use std::num::NonZeroU8;
+use std::num::{NonZeroU16, NonZeroU8};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -14,6 +14,7 @@ type DeletionSender = mpsc::UnboundedSender<PathBuf>;
 #[allow(clippy::identity_op)]
 const DEFAULT_CAPACITY: usize = 1 * 1_024 * 1_024 / 200;
 const POOL_SIZE: NonZeroU8 = unsafe { NonZeroU8::new_unchecked(10) };
+const TASK_BUFFER_SIZE: NonZeroU16 = unsafe { NonZeroU16::new_unchecked(1024) };
 const TEMP_EXT: &str = "tmp";
 
 /// Worker's data chunk state.
@@ -77,11 +78,13 @@ impl DataManager for WorkerDataManager {
 
         tracing::debug!("Initiate task pool.");
 
-        manager.task_pool.start(POOL_SIZE);
+        manager.task_pool.start(POOL_SIZE, TASK_BUFFER_SIZE);
 
         tracing::debug!("Initiate deletion channel.");
 
         let notify = Arc::clone(&manager.deletion_notify);
+        // keep using an unbounded channel here for now as it is intrinsically bounded
+        // by the number of data chunks this manager handles and would have to delete in a row
         let (sender, mut receiver) = mpsc::unbounded_channel();
         manager.deletion_sender.replace(sender);
 

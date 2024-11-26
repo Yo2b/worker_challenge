@@ -11,13 +11,13 @@ rust-version.workspace = true
 bytes.workspace = true
 futures.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
+tempfile.workspace = true
 thiserror.workspace = true
 tokio = { workspace = true, features = ["macros", "fs", "rt", "sync", "time"] }
 tracing.workspace = true
 url.workspace = true
 
 [dev-dependencies]
-tempfile.workspace = true
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tokio-test.workspace = true
 tracing-test.workspace = true

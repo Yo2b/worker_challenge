@@ -119,13 +119,19 @@ impl DataManager for WorkerDataManager {
 
     /// Schedule `chunk` download in background.
     fn download_chunk(&self, chunk: DataChunk) {
-        let data_chunks = self.data_chunks.read().unwrap();
+        if self.data_chunks.read().unwrap().contains_key(&chunk.id) {
+            return;
+        }
 
-        if !data_chunks.contains_key(&chunk.id) {
-            drop(data_chunks);
-
-            // check if the entry is still vacant, otherwise a download has already been initiated in the meantime
-            self.data_chunks.write().unwrap().entry(chunk.id).or_insert_with(|| {
+        self.data_chunks
+            .write()
+            .unwrap()
+            .entry(chunk.id)
+            .and_modify(|_state| {
+                // the entry is occupied, meaning its state is already downloading or ready
+            })
+            .or_insert_with(|| {
+                // the entry is still vacant, meaning no download has been initiated in the meantime
                 let data_chunks = Arc::clone(&self.data_chunks);
 
                 let path = self.chunk_path(&chunk);
@@ -180,7 +186,6 @@ impl DataManager for WorkerDataManager {
 
                 DataChunkState::Downloading(Some(Box::new((chunk, abort_handle))))
             });
-        }
     }
 
     /// List chunks that are currently available.
@@ -204,39 +209,37 @@ impl DataManager for WorkerDataManager {
 
     /// Schedule data chunk for deletion in background.
     fn delete_chunk(&self, chunk_id: ChunkId) {
-        let data_chunks = self.data_chunks.read().unwrap();
+        if !self.data_chunks.read().unwrap().contains_key(&chunk_id) {
+            return;
+        }
 
-        if data_chunks.contains_key(&chunk_id) {
-            drop(data_chunks);
+        let opt_state = self.data_chunks.write().unwrap().remove(&chunk_id);
 
-            let opt_state = self.data_chunks.write().unwrap().remove(&chunk_id);
+        match opt_state {
+            Some(DataChunkState::Downloading(ctx)) => {
+                let (chunk, handle) = *ctx.unwrap();
 
-            match opt_state {
-                Some(DataChunkState::Downloading(ctx)) => {
-                    let (chunk, handle) = *ctx.unwrap();
+                handle.abort();
 
-                    handle.abort();
+                let mut path = self.chunk_path(&chunk);
+                path.set_extension(TEMP_EXT);
 
-                    let mut path = self.chunk_path(&chunk);
-                    path.set_extension(TEMP_EXT);
+                tracing::debug!("Aborted data chunk download to local storage: `{}`", path.display());
 
-                    tracing::debug!("Aborted data chunk download to local storage: `{}`", path.display());
-
-                    // delete incomplete chunk
-                    if let Some(ref sender) = self.deletion_sender {
-                        sender.send(path).unwrap();
-                    }
+                // delete incomplete chunk
+                if let Some(ref sender) = self.deletion_sender {
+                    sender.send(path).unwrap();
                 }
-                Some(DataChunkState::Ready(chunk_ref)) => {
-                    tracing::debug!("Removing data chunk from local storage: `{}`", chunk_ref.path().display());
-
-                    debug_assert!(self.deletion_sender.is_some());
-
-                    // postpone chunk deletion
-                    chunk_ref.notify(self.deletion_sender.clone());
-                }
-                None => { /* entry has already been removed in the meantime */ }
             }
+            Some(DataChunkState::Ready(chunk_ref)) => {
+                tracing::debug!("Removing data chunk from local storage: `{}`", chunk_ref.path().display());
+
+                debug_assert!(self.deletion_sender.is_some());
+
+                // postpone chunk deletion
+                chunk_ref.notify(self.deletion_sender.clone());
+            }
+            None => { /* entry has already been removed in the meantime */ }
         }
     }
 }

@@ -1,6 +1,6 @@
 //! This module provides required task pooling features.
 
-use std::num::NonZeroU8;
+use std::num::{NonZeroU16, NonZeroU8};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -25,7 +25,7 @@ type Task = future::BoxFuture<'static, ()>;
 /// # tokio_test::block_on(async {
 /// # use worker::task::Pool;
 /// let mut pool = Pool::default();
-/// pool.start(3.try_into().unwrap());
+/// pool.start(3.try_into().unwrap(), 10.try_into().unwrap());
 ///
 /// for i in 0..=5 {
 ///     pool.forget(async move { println!("Hello from task #{i}!") });
@@ -49,11 +49,11 @@ pub struct Pool {
     /// The sending part of a channel to push tasks to the workers.
     ///
     /// The next available worker will wait for a task to be received through the channel.
-    sender: Option<mpsc::UnboundedSender<Task>>,
+    sender: Option<mpsc::Sender<Task>>,
 }
 
 impl Pool {
-    /// Start a pool with `size` workers.
+    /// Start a pool with `pool_size` workers and room to buffer up to `buffer_size` tasks.
     ///
     /// Once started, tasks can be pushed and will be processed in the background in order.
     ///
@@ -61,15 +61,15 @@ impl Pool {
     ///
     /// # Panics
     /// This method panics if the pool is already running, ie. when called more than once without stopping the pool in between.
-    pub fn start(&mut self, size: NonZeroU8) {
+    pub fn start(&mut self, pool_size: NonZeroU8, buffer_size: NonZeroU16) {
         assert!(self.sender.is_none() && self.workers.is_empty());
 
-        let (sender, receiver) = mpsc::unbounded_channel();
+        let (sender, receiver) = mpsc::channel(buffer_size.get().into());
 
         let receiver = Arc::new(Mutex::new(receiver));
 
         static WORKER_ID: AtomicUsize = AtomicUsize::new(0);
-        let size = size.get().into();
+        let size = pool_size.get().into();
         let id = WORKER_ID.fetch_add(size, Ordering::Relaxed);
 
         self.workers = (0..size).map(|i| Worker::new(id.wrapping_add(i), Arc::clone(&receiver))).collect();
@@ -88,7 +88,7 @@ impl Pool {
     /// # tokio_test::block_on(async {
     /// # use worker::task::Pool;
     /// # let mut pool = Pool::default();
-    /// # pool.start(3.try_into().unwrap());
+    /// # pool.start(3.try_into().unwrap(), 10.try_into().unwrap());
     /// let (remote_handle, _) = pool.execute(async { "Hello world!" });
     ///
     /// if let Ok(msg) = remote_handle.await {
@@ -116,7 +116,7 @@ impl Pool {
     /// # tokio_test::block_on(async {
     /// # use worker::task::{Aborted, Pool};
     /// # let mut pool = Pool::default();
-    /// # pool.start(3.try_into().unwrap());
+    /// # pool.start(3.try_into().unwrap(), 10.try_into().unwrap());
     /// let (remote_handle, abort_handle) = pool.execute(async { "Hello world!" });
     ///
     /// abort_handle.abort();
@@ -148,7 +148,7 @@ impl Pool {
     #[inline]
     pub fn forget(&self, future: impl Future<Output = ()> + Send + 'static) {
         if let Some(ref sender) = self.sender {
-            sender.send(future.boxed()).unwrap();
+            sender.try_send(future.boxed()).unwrap(); // should handle error here
         }
     }
 
@@ -158,7 +158,7 @@ impl Pool {
     ///
     /// _Note: if a task is sent to the pool while stopped, it is just lost without executing anything._
     pub async fn stop(&mut self) {
-        let _ = self.sender.take().as_ref().map(mpsc::UnboundedSender::downgrade);
+        let _ = self.sender.take().as_ref().map(mpsc::Sender::downgrade);
         let workers = std::mem::take(&mut self.workers);
 
         future::join_all(workers.into_iter().inspect(|worker| {
@@ -182,7 +182,7 @@ struct Worker {
 }
 
 impl Worker {
-    fn new(id: usize, receiver: Arc<Mutex<mpsc::UnboundedReceiver<Task>>>) -> Worker {
+    fn new(id: usize, receiver: Arc<Mutex<mpsc::Receiver<Task>>>) -> Worker {
         tracing::debug!("Starting worker {id}...");
 
         Worker {

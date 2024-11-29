@@ -1,4 +1,4 @@
-use std::num::NonZeroU8;
+use std::num::{NonZeroU16, NonZeroU8};
 use std::ops::Deref;
 use std::sync::{Arc, Mutex, RwLock};
 
@@ -14,6 +14,7 @@ type DeletionSender = mpsc::UnboundedSender<PathBuf>;
 #[allow(clippy::identity_op)]
 const DEFAULT_CAPACITY: usize = 1 * 1_024 * 1_024 / 200;
 const POOL_SIZE: NonZeroU8 = unsafe { NonZeroU8::new_unchecked(10) };
+const TASK_BUFFER_SIZE: NonZeroU16 = unsafe { NonZeroU16::new_unchecked(1024) };
 const TEMP_EXT: &str = "tmp";
 
 /// Worker's data chunk state.
@@ -22,13 +23,16 @@ enum DataChunkState {
     /// Downloading state.
     ///
     /// When requesting for a data chunk download, this entry state is added to the in-memory [`HashMap`] cache for the associated `chunk.id` key.
-    /// The state context is made of the `DataChunk` description and an `AbortHandle` on the task in the pool.
-    Downloading(Option<Box<(DataChunk, AbortHandle)>>),
+    ///
+    /// The state context is made of the `DataChunk` description, its download path and an `AbortHandle` on the task in the pool.
+    Downloading(Option<Box<(DataChunk, PathBuf, AbortHandle)>>),
+
     /// Ready state.
     ///
     /// When completing a data chunk download or reading a data chunk from the local storage, this entry state is added or replaced in-place in the
-    /// in-memory [`HashMap`] cache for the associated `chunk.id` key. The state context is made of the originally owned `DataChunk` wrapped in the
-    /// first `WorkerDataChunkRef`.
+    /// in-memory [`HashMap`] cache for the associated `chunk.id` key.
+    ///
+    /// The state context is made of the originally owned `DataChunk` wrapped in the first `WorkerDataChunkRef`.
     Ready(WorkerDataChunkRef),
 }
 
@@ -77,11 +81,13 @@ impl DataManager for WorkerDataManager {
 
         tracing::debug!("Initiate task pool.");
 
-        manager.task_pool.start(POOL_SIZE);
+        manager.task_pool.start(POOL_SIZE, TASK_BUFFER_SIZE);
 
         tracing::debug!("Initiate deletion channel.");
 
         let notify = Arc::clone(&manager.deletion_notify);
+        // keep using an unbounded channel here for now as it is intrinsically bounded
+        // by the number of data chunks this manager handles and would have to delete in a row
         let (sender, mut receiver) = mpsc::unbounded_channel();
         manager.deletion_sender.replace(sender);
 
@@ -119,25 +125,30 @@ impl DataManager for WorkerDataManager {
 
     /// Schedule `chunk` download in background.
     fn download_chunk(&self, chunk: DataChunk) {
-        let data_chunks = self.data_chunks.read().unwrap();
+        if self.data_chunks.read().unwrap().contains_key(&chunk.id) {
+            return;
+        }
 
-        if !data_chunks.contains_key(&chunk.id) {
-            drop(data_chunks);
-
-            // check if the entry is still vacant, otherwise a download has already been initiated in the meantime
-            self.data_chunks.write().unwrap().entry(chunk.id).or_insert_with(|| {
+        self.data_chunks
+            .write()
+            .unwrap()
+            .entry(chunk.id)
+            .and_modify(|_state| {
+                // the entry is occupied, meaning its state is already downloading or ready
+            })
+            .or_insert_with(|| {
+                // the entry is still vacant, meaning no download has been initiated in the meantime
                 let data_chunks = Arc::clone(&self.data_chunks);
 
-                let path = self.chunk_path(&chunk);
+                let dst = self.chunk_path(&chunk);
+                let tmp = self.chunk_tmp_path(&chunk);
+                let path = tmp.clone();
                 let files = chunk.files.clone();
 
                 let (remote_handle, abort_handle) = self.task_pool.execute(async move {
-                    tracing::debug!("Downloading data chunk to local storage: `{}`", path.display());
+                    tracing::debug!("Downloading data chunk to local storage: `{}`", tmp.display());
 
-                    // let path = path.canonicalize()?;
-                    let tmp = path.with_extension(TEMP_EXT);
-
-                    tokio::fs::create_dir_all(&tmp).await?;
+                    // tokio::fs::create_dir_all(&tmp).await?;
 
                     // TODO: write chunk descriptor (file names with their associated HTTP URL) to local storage
 
@@ -145,9 +156,9 @@ impl DataManager for WorkerDataManager {
                     manager.batch_download(files).await?;
                     // manager.pool_download(files).await?;
 
-                    tokio::fs::rename(manager.path(), &path).await?;
+                    tokio::fs::rename(manager.path(), &dst).await?;
 
-                    tracing::debug!("Downloaded data chunk to local storage: `{}`", path.display());
+                    tracing::debug!("Downloaded data chunk to local storage: `{}`", dst.display());
 
                     // chunk can still be canceled while awaiting for a write access,
                     // in which case entry has been removed otherwise it can be granted to ready state
@@ -157,20 +168,20 @@ impl DataManager for WorkerDataManager {
                         .get_mut(&chunk.id)
                         .map(|state| match state {
                             DataChunkState::Downloading(ctx) => {
-                                let (chunk, handle) = *ctx.take().unwrap();
+                                let (chunk, _, handle) = *ctx.take().unwrap();
 
-                                debug_assert!(!handle.is_aborted());
+                                debug_assert!(!handle.is_aborted(), "download handle shoudn't have been aborted at this point");
 
-                                *state = DataChunkState::Ready(WorkerDataChunkRef::new(path.clone(), chunk));
+                                *state = DataChunkState::Ready(WorkerDataChunkRef::new(dst.clone(), chunk));
                             }
                             _ => unreachable!(),
                         })
                         .is_none();
 
                     if canceled {
-                        tracing::debug!("Deleting canceled data chunk from local storage: `{}`", path.display());
+                        tracing::debug!("Deleting canceled data chunk from local storage: `{}`", dst.display());
 
-                        tokio::fs::remove_dir_all(&path).await?;
+                        tokio::fs::remove_dir_all(&dst).await?;
                     }
 
                     Ok::<_, crate::download::Error>(())
@@ -178,9 +189,8 @@ impl DataManager for WorkerDataManager {
 
                 remote_handle.forget(); // forget remote handle for now but should be used to deal with errors
 
-                DataChunkState::Downloading(Some(Box::new((chunk, abort_handle))))
+                DataChunkState::Downloading(Some(Box::new((chunk, path, abort_handle))))
             });
-        }
     }
 
     /// List chunks that are currently available.
@@ -204,39 +214,34 @@ impl DataManager for WorkerDataManager {
 
     /// Schedule data chunk for deletion in background.
     fn delete_chunk(&self, chunk_id: ChunkId) {
-        let data_chunks = self.data_chunks.read().unwrap();
+        if !self.data_chunks.read().unwrap().contains_key(&chunk_id) {
+            return;
+        }
 
-        if data_chunks.contains_key(&chunk_id) {
-            drop(data_chunks);
+        let opt_state = self.data_chunks.write().unwrap().remove(&chunk_id);
 
-            let opt_state = self.data_chunks.write().unwrap().remove(&chunk_id);
+        match opt_state {
+            Some(DataChunkState::Downloading(ctx)) => {
+                let (_, path, handle) = *ctx.unwrap();
 
-            match opt_state {
-                Some(DataChunkState::Downloading(ctx)) => {
-                    let (chunk, handle) = *ctx.unwrap();
+                handle.abort();
 
-                    handle.abort();
+                tracing::debug!("Aborted data chunk download to local storage: `{}`", path.display());
 
-                    let mut path = self.chunk_path(&chunk);
-                    path.set_extension(TEMP_EXT);
-
-                    tracing::debug!("Aborted data chunk download to local storage: `{}`", path.display());
-
-                    // delete incomplete chunk
-                    if let Some(ref sender) = self.deletion_sender {
-                        sender.send(path).unwrap();
-                    }
+                // delete incomplete chunk
+                if let Some(ref sender) = self.deletion_sender {
+                    sender.send(path).unwrap();
                 }
-                Some(DataChunkState::Ready(chunk_ref)) => {
-                    tracing::debug!("Removing data chunk from local storage: `{}`", chunk_ref.path().display());
-
-                    debug_assert!(self.deletion_sender.is_some());
-
-                    // postpone chunk deletion
-                    chunk_ref.notify(self.deletion_sender.clone());
-                }
-                None => { /* entry has already been removed in the meantime */ }
             }
+            Some(DataChunkState::Ready(chunk_ref)) => {
+                tracing::debug!("Removing data chunk from local storage: `{}`", chunk_ref.path().display());
+
+                debug_assert!(self.deletion_sender.is_some(), "deletion sender shall be initialized at this point");
+
+                // postpone chunk deletion
+                chunk_ref.notify(self.deletion_sender.clone());
+            }
+            None => { /* entry has already been removed in the meantime */ }
         }
     }
 }
@@ -257,17 +262,36 @@ impl WorkerDataManager {
         }
     }
 
-    /// Return the expected path in the local storage related to this data chunk.
-    fn chunk_path(&self, chunk: &DataChunk) -> PathBuf {
-        let chunk_id = [
+    /// Return the expected stored id in the local storage related to this data chunk.
+    fn chunk_id(chunk: &DataChunk) -> std::ffi::OsString {
+        [
             utils::encode_id(&chunk.id),
             utils::encode_id(&chunk.dataset_id),
             chunk.block_range.start.to_string().as_ref(),
             chunk.block_range.end.to_string().as_ref(),
         ]
-        .join(std::ffi::OsStr::new("_"));
+        .join(std::ffi::OsStr::new("_"))
+    }
 
-        self.data_dir.join(chunk_id)
+    /// Return the expected path in the local storage related to this data chunk.
+    #[inline]
+    fn chunk_path(&self, chunk: &DataChunk) -> PathBuf {
+        self.data_dir.join(Self::chunk_id(chunk))
+    }
+
+    /// Return a unique temp path in the local storage related to this data chunk.
+    fn chunk_tmp_path(&self, chunk: &DataChunk) -> PathBuf {
+        let mut prefix = Self::chunk_id(chunk);
+        prefix.push(".");
+
+        let suffix = format!(".{TEMP_EXT}");
+
+        tempfile::Builder::default()
+            .prefix(&prefix)
+            .suffix(&suffix)
+            .tempdir_in(&self.data_dir)
+            .expect("temp dir cannot be created")
+            .into_path()
     }
 
     /// Return the expected data chunk related to this path in the local storage.
@@ -363,8 +387,13 @@ impl WorkerDataChunkRef {
         }
     }
 
-    fn notify(&self, sender: Option<DeletionSender>) {
-        *self.ctx.2.lock().unwrap() = sender;
+    fn notify(&self, sender: Option<DeletionSender>) -> Option<DeletionSender> {
+        let mut ctx_sender = self.ctx.2.lock().unwrap();
+        debug_assert!(
+            ctx_sender.as_ref().xor(sender.as_ref()).is_some(),
+            "deletion channel should be set/unset only once"
+        );
+        std::mem::replace(&mut ctx_sender, sender)
     }
 }
 
@@ -476,7 +505,9 @@ mod tests {
     #[test]
     #[tracing_test::traced_test]
     fn test_data_manager_uninit() {
-        let manager = WorkerDataManager::new_uninit(PathBuf::from("path/is/unlikely/to/exist"));
+        let temp = tempfile::tempdir().unwrap();
+
+        let manager = WorkerDataManager::new_uninit(temp.path().to_path_buf());
 
         assert!(manager.list_chunks().is_empty());
         manager.download_chunk(expected_data_chunk());

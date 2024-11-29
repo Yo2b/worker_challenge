@@ -76,18 +76,18 @@ The crates in this workspace may rely on other renowned, widely tried and tested
 - _"Think about possibilities of receiving multiple download requests for the same chunk or chunk deletion request followed by immediate download."_:
   - Multiple download requests for the same chunk are considered only once, assuming that `(chunk_id, dataset_id, block_range)` tuples are unique.
   - Chunk deletion request followed by immediate download is considered as a "forced" new download.
-  - I suspect there could still be a risk of time-of-check to time-of-use (TOCTOU) bugs (or kind of) when requesting:
+  - I suspect ~~there could still be a risk of time-of-check to time-of-use (TOCTOU) bugs (or kind of)~~ when requesting:
     - download chunk
     - delete chunk before completion (abort) -> postpone cleaning task
     - download chunk before execution or completion of cleaning task -> postpone downloading task
-      - colliding downloading task
-      - colliding cleaning task
+      - ~~colliding downloading task~~
+      - ~~colliding cleaning task~~
 
 ## Improvements
 - Add more ~~doc comments and~~ unit tests, as well as full test data sets.
 - ~~Properly finalize `task::Pool` when `WorkerDataManager` is dropped~~.
 - ~~Fix data chunk deletion after all data chunk references have been dropped~~.
-- Use dedicated temp directories for processing chunk downloads, eg. make them unique replacing `tmp` extension with timestamp- and/or random-based naming.
+- ~~Use dedicated temp directories for processing chunk downloads, eg. make them unique replacing `tmp` extension with timestamp- and/or random-based naming~~.
 - Manage I/O errors, HTTP errors, data chunk errors... and deal with HTTP retries.
 - Implement `serde` (de)serialization traits for `DataChunk` type and read/write data chunk descriptors to local storage.
 - Check for data integrity when reading/writing to local data storage.

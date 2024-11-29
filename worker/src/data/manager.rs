@@ -165,7 +165,7 @@ impl DataManager for WorkerDataManager {
                             DataChunkState::Downloading(ctx) => {
                                 let (chunk, handle) = *ctx.take().unwrap();
 
-                                debug_assert!(!handle.is_aborted());
+                                debug_assert!(!handle.is_aborted(), "download handle shoudn't have been aborted at this point");
 
                                 *state = DataChunkState::Ready(WorkerDataChunkRef::new(path.clone(), chunk));
                             }
@@ -234,7 +234,7 @@ impl DataManager for WorkerDataManager {
             Some(DataChunkState::Ready(chunk_ref)) => {
                 tracing::debug!("Removing data chunk from local storage: `{}`", chunk_ref.path().display());
 
-                debug_assert!(self.deletion_sender.is_some());
+                debug_assert!(self.deletion_sender.is_some(), "deletion sender shall be initialized at this point");
 
                 // postpone chunk deletion
                 chunk_ref.notify(self.deletion_sender.clone());
@@ -366,8 +366,13 @@ impl WorkerDataChunkRef {
         }
     }
 
-    fn notify(&self, sender: Option<DeletionSender>) {
-        *self.ctx.2.lock().unwrap() = sender;
+    fn notify(&self, sender: Option<DeletionSender>) -> Option<DeletionSender> {
+        let mut ctx_sender = self.ctx.2.lock().unwrap();
+        debug_assert!(
+            ctx_sender.as_ref().xor(sender.as_ref()).is_some(),
+            "deletion channel should be set/unset only once"
+        );
+        std::mem::replace(&mut ctx_sender, sender)
     }
 }
 
